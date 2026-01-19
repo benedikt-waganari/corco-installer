@@ -4,19 +4,19 @@
 
 ## Run Setup
 
-Click the button below to start the automated setup:
+Click the **terminal icon** (▷) next to the command below to run it:
 
 ```sh
 ./setup.sh
 ```
 
-The script will:
-- Configure your GCP project
-- Set up BigQuery tables
-- Deploy Cloud Functions
-- Configure integrations
+The script will prompt you to paste your **setup token** from the landing page.
 
-You'll be prompted to paste your **setup token** (from the email/landing page).
+**What happens next:**
+- GCP project configuration
+- BigQuery tables created
+- Cloud Functions deployed
+- Integrations configured
 
 <walkthrough-conclusion-trophy></walkthrough-conclusion-trophy>
 
