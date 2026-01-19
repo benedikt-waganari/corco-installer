@@ -97,9 +97,17 @@ chmod +x setup.sh
 # Pass token and extracted data to the real setup script
 ./setup.sh --token="$TOKEN" --domain="$DOMAIN"
 
-# Cleanup
+# Cleanup downloaded files
 cd ../../..
 rm -rf corco-setup corco-installer.tar.gz
 
 echo ""
 echo -e "${GREEN}✓ Setup complete!${NC}"
+
+# If running in Cloud Shell, clean up the installer repo itself
+if [ "$CLOUD_SHELL" = "true" ]; then
+    INSTALLER_DIR=$(cd "$(dirname "$0")" && pwd)
+    echo -e "${BLUE}Cleaning up installer...${NC}"
+    cd ~
+    rm -rf "$INSTALLER_DIR"
+fi
