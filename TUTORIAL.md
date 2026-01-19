@@ -13,7 +13,3 @@ Copy the command below, paste it in the terminal, and press **Enter**:
 When prompted, paste your **setup token** from the landing page.
 
 The script will automatically detect your domain and configure everything.
-
-<walkthrough-conclusion-trophy></walkthrough-conclusion-trophy>
-
-Setup complete!
