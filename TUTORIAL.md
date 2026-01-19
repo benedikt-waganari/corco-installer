@@ -4,20 +4,16 @@
 
 ## Run Setup
 
-Click the **terminal icon** (▷) next to the command below to run it:
+Copy the command below, paste it in the terminal, and press **Enter**:
 
 ```sh
 ./setup.sh
 ```
 
-The script will prompt you to paste your **setup token** from the landing page.
+When prompted, paste your **setup token** from the landing page.
 
-**What happens next:**
-- GCP project configuration
-- BigQuery tables created
-- Cloud Functions deployed
-- Integrations configured
+The script will automatically detect your domain and configure everything.
 
 <walkthrough-conclusion-trophy></walkthrough-conclusion-trophy>
 
-Setup complete! Check your email for next steps.
+Setup complete!
