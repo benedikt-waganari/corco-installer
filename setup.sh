@@ -18,10 +18,14 @@ echo -e "${BLUE}╚════════════════════�
 echo ""
 
 # Parse arguments (token can be passed as argument or entered interactively)
+RESUME_FLAG=""
 for i in "$@"; do
 case $i in
     --token=*)
     TOKEN="${i#*=}"
+    ;;
+    --resume)
+    RESUME_FLAG="--resume"
     ;;
     *)
     # unknown option
@@ -95,7 +99,7 @@ cd corco-setup/deployment/scripts
 chmod +x setup.sh
 
 # Pass token and extracted data to the real setup script
-./setup.sh --token="$TOKEN" --domain="$DOMAIN"
+./setup.sh --token="$TOKEN" --domain="$DOMAIN" $RESUME_FLAG
 
 # Cleanup downloaded files
 cd ../../..
