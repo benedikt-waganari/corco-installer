@@ -85,6 +85,7 @@ TEARDOWN_TOKEN=""
 DELETE_DATA=false
 DELETE_SECRETS=false
 DELETE_CONFIG=false
+KEEP_PROJECT=false
 RESTORE_ORG_POLICY=false
 FORCE=false
 
@@ -120,6 +121,10 @@ while [[ $# -gt 0 ]]; do
             FORCE=true
             shift
             ;;
+        --keep-project)
+            KEEP_PROJECT=true
+            shift
+            ;;
         --restore-org-policy)
             RESTORE_ORG_POLICY=true
             shift
@@ -137,16 +142,18 @@ while [[ $# -gt 0 ]]; do
             echo "  --delete-data        Also delete BigQuery dataset (IRREVERSIBLE)"
             echo "  --delete-secrets     Also delete CORCO_* secrets"
             echo "  --delete-config      Also delete tfvars configuration file"
-            echo "  --all                Delete everything (data + secrets + config)"
+            echo "  --all                Delete everything (data + secrets + config + project)"
+            echo "  --keep-project       With --all: delete resources but keep GCP project & billing"
             echo "  --restore-org-policy Reinstate iam.allowedPolicyMemberDomains restriction"
             echo "  --force, -f          Skip confirmation prompts"
             echo "  --help, -h           Show this help"
             echo ""
             echo "Examples:"
-            echo "  $0 waganari.capital                    # Safe teardown (keeps data)"
-            echo "  $0 waganari.capital --delete-secrets   # Teardown + remove secrets"
-            echo "  $0 waganari.capital --all              # Complete wipe"
-            echo "  $0 waganari.capital --all --force      # Complete wipe, no prompts"
+            echo "  $0 waganari.capital                          # Safe teardown (keeps data)"
+            echo "  $0 waganari.capital --delete-secrets          # Teardown + remove secrets"
+            echo "  $0 waganari.capital --all                     # Complete wipe (deletes project)"
+            echo "  $0 waganari.capital --all --keep-project      # Wipe resources, keep project"
+            echo "  $0 waganari.capital --all --force              # Complete wipe, no prompts"
             exit 0
             ;;
         -*)
@@ -396,9 +403,123 @@ elif ! gcloud projects describe "$PROJECT_ID" &>/dev/null 2>&1; then
     echo "  It may have already been deleted. Continuing with local cleanup..."
 fi
 
-# For --all teardowns, simply delete the entire GCP project
-# This is simpler and more reliable than Terraform (no billing/state issues)
-if [ "$DELETE_DATA" == "true" ] && [ "$DELETE_SECRETS" == "true" ] && [ "$DELETE_CONFIG" == "true" ]; then
+# ─────────────────────────────────────────────────────────────────────────────
+# --keep-project mode: delete all resources INSIDE the project via gcloud,
+# but keep the project itself and its billing link intact.
+# No Terraform needed (works without state, e.g. in Cloud Shell).
+# ─────────────────────────────────────────────────────────────────────────────
+if [ "$KEEP_PROJECT" == "true" ] && [ "$PROJECT_EXISTS" == "true" ]; then
+    log_step "Cleaning Resources (Keeping Project)"
+    
+    echo ""
+    echo "Removing all deployment resources from project $PROJECT_ID..."
+    echo "Project and billing will be preserved."
+    echo ""
+    
+    REGION="${REGION:-us-central1}"
+    
+    # 1. Delete Telegram webhook (before deleting secrets)
+    echo "  [1/7] Telegram webhook..."
+    TELEGRAM_TOKEN=$(gcloud secrets versions access latest --secret="CORCO_TELEGRAM_BOT_TOKEN" --project="$PROJECT_ID" 2>/dev/null || echo "")
+    if [ -n "$TELEGRAM_TOKEN" ]; then
+        curl -s "https://api.telegram.org/bot${TELEGRAM_TOKEN}/deleteWebhook" >/dev/null 2>&1
+        log_success "Telegram webhook removed"
+    else
+        echo "    No Telegram token found - skipping"
+    fi
+    
+    # 2. Delete all Cloud Functions (gen1 + gen2)
+    echo "  [2/7] Cloud Functions..."
+    FUNCTIONS=$(gcloud functions list --project="$PROJECT_ID" --format="value(name)" 2>/dev/null || echo "")
+    if [ -n "$FUNCTIONS" ]; then
+        echo "$FUNCTIONS" | while read fn; do
+            # Determine region from function metadata
+            FN_REGION=$(gcloud functions describe "$fn" --project="$PROJECT_ID" --format="value(labels.deployment-tool)" 2>/dev/null || echo "")
+            gcloud functions delete "$fn" --region="$REGION" --project="$PROJECT_ID" --quiet 2>/dev/null || \
+            gcloud functions delete "$fn" --gen2 --region="$REGION" --project="$PROJECT_ID" --quiet 2>/dev/null || true
+            echo "    Deleted: $fn"
+        done
+        log_success "Cloud Functions deleted"
+    else
+        echo "    No functions found"
+    fi
+    
+    # 3. Delete Cloud Scheduler jobs
+    echo "  [3/7] Cloud Scheduler jobs..."
+    JOBS=$(gcloud scheduler jobs list --project="$PROJECT_ID" --location="$REGION" --format="value(name)" 2>/dev/null || echo "")
+    if [ -n "$JOBS" ]; then
+        echo "$JOBS" | while read job; do
+            JOB_NAME=$(basename "$job")
+            gcloud scheduler jobs delete "$JOB_NAME" --location="$REGION" --project="$PROJECT_ID" --quiet 2>/dev/null || true
+            echo "    Deleted: $JOB_NAME"
+        done
+        log_success "Scheduler jobs deleted"
+    else
+        echo "    No scheduler jobs found"
+    fi
+    
+    # 4. Delete CORCO_* secrets
+    if [ "$DELETE_SECRETS" == "true" ]; then
+        echo "  [4/7] Secrets..."
+        SECRETS=$(gcloud secrets list --project="$PROJECT_ID" --filter="name:CORCO" --format="value(name)" 2>/dev/null || echo "")
+        if [ -n "$SECRETS" ]; then
+            echo "$SECRETS" | while read secret; do
+                gcloud secrets delete "$secret" --project="$PROJECT_ID" --quiet 2>/dev/null || true
+                echo "    Deleted: $secret"
+            done
+            log_success "Secrets deleted"
+        else
+            echo "    No CORCO_* secrets found"
+        fi
+    else
+        echo "  [4/7] Secrets: preserved (no --delete-secrets)"
+    fi
+    
+    # 5. Delete GCS buckets
+    echo "  [5/7] GCS buckets..."
+    for bucket in "${PROJECT_ID}-recordings" "${PROJECT_ID}-voice" "${PROJECT_ID}-tfstate"; do
+        if gsutil ls -b "gs://${bucket}" &>/dev/null 2>&1; then
+            gsutil -m rm -r "gs://${bucket}/**" 2>/dev/null || true
+            gsutil rb "gs://${bucket}" 2>/dev/null || true
+            echo "    Deleted: gs://${bucket}"
+        fi
+    done
+    log_success "GCS buckets cleaned"
+    
+    # 6. Delete BigQuery dataset
+    if [ "$DELETE_DATA" == "true" ]; then
+        echo "  [6/7] BigQuery dataset..."
+        if bq show --project_id="$PROJECT_ID" corporate_context &>/dev/null 2>&1; then
+            bq rm -r -f --project_id="$PROJECT_ID" corporate_context 2>/dev/null || true
+            log_success "BigQuery dataset deleted"
+        else
+            echo "    No BigQuery dataset found"
+        fi
+    else
+        echo "  [6/7] BigQuery: preserved (no --delete-data)"
+    fi
+    
+    # 7. Delete service accounts (created by Terraform)
+    echo "  [7/7] Service accounts..."
+    for sa in gmail-sync-sa twilio-ingest-sa; do
+        SA_EMAIL="${sa}@${PROJECT_ID}.iam.gserviceaccount.com"
+        if gcloud iam service-accounts describe "$SA_EMAIL" --project="$PROJECT_ID" &>/dev/null 2>&1; then
+            gcloud iam service-accounts delete "$SA_EMAIL" --project="$PROJECT_ID" --quiet 2>/dev/null || true
+            echo "    Deleted: $SA_EMAIL"
+        fi
+    done
+    log_success "Service accounts cleaned"
+    
+    echo ""
+    log_success "All resources removed. Project $PROJECT_ID preserved with billing intact."
+    
+    # Mark as done so later sections skip GCP operations
+    PROJECT_DELETED="false"
+
+# ─────────────────────────────────────────────────────────────────────────────
+# --all mode (without --keep-project): delete the entire GCP project
+# ─────────────────────────────────────────────────────────────────────────────
+elif [ "$DELETE_DATA" == "true" ] && [ "$DELETE_SECRETS" == "true" ] && [ "$DELETE_CONFIG" == "true" ]; then
     
     # ── Pre-deletion cleanup: deregister Telegram webhook ──
     if [ "$PROJECT_EXISTS" == "true" ]; then
@@ -797,7 +918,16 @@ if [ "$RESTORE_ORG_POLICY" == "true" ]; then
 fi
 echo ""
 
-if [ "$DELETE_DATA" == "true" ] && [ "$DELETE_SECRETS" == "true" ] && [ "$DELETE_CONFIG" == "true" ]; then
+if [ "$KEEP_PROJECT" == "true" ]; then
+    echo -e "  • GCP Project: ${GREEN}PRESERVED${NC} (with billing)"
+    echo ""
+    echo -e "${GREEN}Resource cleanup complete.${NC} Project preserved and ready for fresh install."
+    echo ""
+    echo "To reinstall:"
+    echo "  Run setup.sh with your token (project and billing are intact)"
+elif [ "$DELETE_DATA" == "true" ] && [ "$DELETE_SECRETS" == "true" ] && [ "$DELETE_CONFIG" == "true" ]; then
+    echo -e "  • GCP Project: ${RED}DELETED${NC}"
+    echo ""
     echo -e "${GREEN}Full cleanup complete.${NC} The project is ready for a fresh install."
     echo ""
     echo "Everything removed:"
