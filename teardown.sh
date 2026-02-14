@@ -388,6 +388,26 @@ fi
 # For --all teardowns, simply delete the entire GCP project
 # This is simpler and more reliable than Terraform (no billing/state issues)
 if [ "$DELETE_DATA" == "true" ] && [ "$DELETE_SECRETS" == "true" ] && [ "$DELETE_CONFIG" == "true" ]; then
+    
+    # ── Pre-deletion cleanup: deregister Telegram webhook ──
+    if [ "$PROJECT_EXISTS" == "true" ]; then
+        log_step "Pre-deletion Cleanup"
+        
+        # Delete Telegram webhook (prevents Telegram from hitting a dead URL after project deletion)
+        TELEGRAM_TOKEN=$(gcloud secrets versions access latest --secret="CORCO_TELEGRAM_BOT_TOKEN" --project="$PROJECT_ID" 2>/dev/null || echo "")
+        if [ -n "$TELEGRAM_TOKEN" ]; then
+            echo "Removing Telegram webhook..."
+            WEBHOOK_DEL=$(curl -s "https://api.telegram.org/bot${TELEGRAM_TOKEN}/deleteWebhook" 2>/dev/null || echo "")
+            if echo "$WEBHOOK_DEL" | grep -q '"ok":true'; then
+                log_success "Telegram webhook removed"
+            else
+                log_warning "Could not remove Telegram webhook (may already be gone)"
+            fi
+        else
+            echo "No Telegram bot token found - skipping webhook cleanup"
+        fi
+    fi
+    
     log_step "Deleting GCP Project"
     
     if [ "$PROJECT_EXISTS" == "false" ]; then
@@ -416,9 +436,6 @@ if [ "$DELETE_DATA" == "true" ] && [ "$DELETE_SECRETS" == "true" ] && [ "$DELETE
         echo "Deleting project $PROJECT_ID..."
         if gcloud projects delete "$PROJECT_ID" --quiet 2>&1; then
             log_success "GCP project deleted"
-            log_warning "Project ID '$PROJECT_ID' is now blocked by GCP for 30 days."
-            echo "  A new project with the same ID cannot be created during this period."
-            echo "  To restore: gcloud projects undelete $PROJECT_ID"
             PROJECT_DELETED="true"
         else
             # Check if it's because project is already gone
@@ -489,6 +506,7 @@ else
                     -target=module.scheduler \
                     -target=module.secrets \
                     -target=module.storage \
+                    -target=module.monitoring \
                     -out=destroy.plan -input=false 2>&1
             fi
             TF_PLAN_EXIT=$?

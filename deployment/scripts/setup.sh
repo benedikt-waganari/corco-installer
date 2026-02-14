@@ -220,7 +220,11 @@ mark_step_complete() {
 }
 
 clear_state() {
-    [ -n "$STATE_FILE" ] && rm -f "$STATE_FILE"
+    # Instead of deleting the state file, mark it as completed.
+    # This prevents --resume from re-executing everything after a successful run.
+    if [ -n "$STATE_FILE" ] && [ -f "$STATE_FILE" ]; then
+        save_state "setup_completed" "true"
+    fi
 }
 
 create_secret() {
@@ -292,6 +296,21 @@ if [ -n "$SETUP_TOKEN" ] && [ -n "$SETUP_DOMAIN" ]; then
     
     if [ "$RESUME_MODE" == "true" ]; then
         if [ -f "$STATE_FILE" ]; then
+            # Check if a previous setup already completed successfully
+            PREV_COMPLETED=$(load_state "setup_completed" "false")
+            if [ "$PREV_COMPLETED" == "true" ]; then
+                echo ""
+                echo -e "${GREEN}A previous setup for this domain completed successfully.${NC}"
+                echo ""
+                read -p "Run setup again from scratch? [y/N]: " run_again
+                if [[ ! "$run_again" =~ ^[Yy] ]]; then
+                    echo "Aborting. Use teardown.sh first if you want a clean reinstall."
+                    exit 0
+                fi
+                # User wants to re-run: clear the state file for a fresh start
+                rm -f "$STATE_FILE"
+                RESUME_MODE="false"
+            fi
             echo -e "${CYAN}Resuming from previous session...${NC}"
             echo -e "  State file: ${STATE_FILE}"
             echo -e "  Completed steps: $(grep 'step_.*=true' "$STATE_FILE" 2>/dev/null | cut -d'=' -f1 | tr '\n' ' ')"
@@ -343,6 +362,9 @@ read -p "Press Enter to continue (or Ctrl+C to abort)..."
 # =============================================================================
 # Step 1: Pre-flight Checks
 # =============================================================================
+
+# Always resolve the current account (needed for registration even on --resume)
+CURRENT_ACCOUNT=$(gcloud config get-value account 2>/dev/null || echo "")
 
 if step_completed "preflight"; then
     log_step "Step 1/8: Pre-flight Checks (already completed)"
@@ -574,17 +596,53 @@ PROJECT_STATE=$(gcloud projects describe "$PROJECT_ID" --format="value(lifecycle
 
 if [ "$PROJECT_STATE" = "ACTIVE" ]; then
     echo -e "${YELLOW}Project $PROJECT_ID already exists${NC}"
-    read -p "Use existing project? [Y/n]: " use_existing
-    if [[ "$use_existing" =~ ^[Nn] ]]; then
-        log_error "Please choose a different project ID"
-        exit 1
+    echo ""
+    echo "  An existing deployment was found. To ensure a clean install,"
+    echo "  the previous deployment should be torn down first."
+    echo ""
+    read -p "Tear down existing deployment and start fresh? [Y/n]: " teardown_existing
+    if [[ "$teardown_existing" =~ ^[Nn] ]]; then
+        echo ""
+        read -p "Use existing project as-is? [Y/n]: " use_existing
+        if [[ "$use_existing" =~ ^[Nn] ]]; then
+            log_error "Please choose a different project ID or tear down the existing one."
+            exit 1
+        fi
+        log_success "Using existing project (without teardown)"
+    else
+        echo ""
+        echo "Running teardown..."
+        TEARDOWN_SCRIPT="$SCRIPT_DIR/teardown.sh"
+        if [ -f "$TEARDOWN_SCRIPT" ]; then
+            bash "$TEARDOWN_SCRIPT" "$DOMAIN" --all --force || true
+            echo ""
+            # After --all teardown, the project is in DELETE_REQUESTED state.
+            # Re-check and undelete it for the fresh install.
+            PROJECT_STATE=$(gcloud projects describe "$PROJECT_ID" --format="value(lifecycleState)" 2>/dev/null || echo "NOT_FOUND")
+            if [ "$PROJECT_STATE" = "DELETE_REQUESTED" ]; then
+                echo "Restoring project for fresh install..."
+                gcloud projects undelete "$PROJECT_ID" --quiet
+                log_success "Project restored from pending deletion"
+            elif [ "$PROJECT_STATE" = "NOT_FOUND" ]; then
+                echo "Creating project: $PROJECT_ID"
+                DISPLAY_DOMAIN=$(echo "$DOMAIN" | sed 's/\.[^.]*$//' | tr '.' ' ')
+                PROJECT_DISPLAY_NAME="Ingestion - ${DISPLAY_DOMAIN}"
+                PROJECT_DISPLAY_NAME="${PROJECT_DISPLAY_NAME:0:30}"
+                gcloud projects create "$PROJECT_ID" --name="$PROJECT_DISPLAY_NAME" --quiet
+                log_success "Project created"
+            else
+                log_success "Project ready after teardown"
+            fi
+        else
+            log_warning "Teardown script not found at: $TEARDOWN_SCRIPT"
+            echo "  Continuing with existing project..."
+        fi
     fi
-    log_success "Using existing project"
 elif [ "$PROJECT_STATE" = "DELETE_REQUESTED" ]; then
     echo -e "${YELLOW}Project $PROJECT_ID exists but is pending deletion${NC}"
     read -p "Restore and reuse it? [Y/n]: " restore_project
     if [[ "$restore_project" =~ ^[Nn] ]]; then
-        log_error "Cannot create a new project with the same ID while deletion is pending (up to 30 days). Choose a different domain or wait."
+        log_error "Cannot create a new project with the same ID while deletion is pending (up to 30 days)."
         exit 1
     fi
     echo "Restoring project..."
@@ -604,7 +662,6 @@ fi
 
 # Link billing (skip if already linked to the selected account)
 CURRENT_BILLING=$(gcloud billing projects describe "$PROJECT_ID" --format="value(billingAccountName)" 2>/dev/null || echo "")
-# CURRENT_BILLING comes back as "billingAccounts/XXXXXX-XXXXXX-XXXXXX"
 CURRENT_BILLING_ID=$(echo "$CURRENT_BILLING" | sed 's|billingAccounts/||')
 
 if [ "$CURRENT_BILLING_ID" = "$BILLING_ID" ]; then
@@ -1896,6 +1953,10 @@ fi
 # Step 8: Register with Corco
 # =============================================================================
 
+if step_completed "registration"; then
+    log_step "Step 8/8: Registration (already completed)"
+    log_success "Skipping - already registered"
+else
 log_step "Step 8/8: Registration"
 
 echo ""
@@ -1989,6 +2050,9 @@ else
     echo "  You may need to manually notify Corco support."
 fi
 
+mark_step_complete "registration"
+fi  # End of: if step_completed "registration"
+
 # =============================================================================
 # Step 8.5: Trigger Historical Imports (if enabled)
 # =============================================================================
@@ -2003,6 +2067,9 @@ fi
 
 # ── Twilio Historical Import ──
 if [ "$TWILIO_IMPORT_EXISTING" == "true" ] && [ "$ENABLE_TWILIO" == "true" ]; then
+  if step_completed "historical_twilio"; then
+    echo "  Twilio historical import: already triggered"
+  else
     echo -e "${CYAN}━━━ Twilio Historical Import ━━━${NC}"
     
     # Get the historical import function URL
@@ -2030,11 +2097,16 @@ if [ "$TWILIO_IMPORT_EXISTING" == "true" ] && [ "$ENABLE_TWILIO" == "true" ]; th
         log_warning "Twilio historical import function not found"
         echo "  Function may not be deployed yet. Historical import will need to be triggered manually."
     fi
+    mark_step_complete "historical_twilio"
     echo ""
+  fi
 fi
 
 # ── Google Meet Historical Import ──
 if [ "$MEET_IMPORT_EXISTING" == "true" ]; then
+  if step_completed "historical_meet"; then
+    echo "  Google Meet historical import: already triggered"
+  else
     echo -e "${CYAN}━━━ Google Meet Historical Import ━━━${NC}"
     
     # Get the drive sync function URL (same function, different parameter)
@@ -2057,7 +2129,9 @@ if [ "$MEET_IMPORT_EXISTING" == "true" ]; then
         log_warning "Google Meet sync function not found"
         echo "  Function may not be deployed yet. Historical import will need to be triggered manually."
     fi
+    mark_step_complete "historical_meet"
     echo ""
+  fi
 fi
 
 # =============================================================================
@@ -2098,9 +2172,14 @@ CALL_INITIATED="false"
 # ── Step 9a: Send Welcome Email ──
 echo -e "${CYAN}━━━ Sending Welcome Communications ━━━${NC}"
 echo ""
-echo "  [1/3] Sending welcome email to $ADMIN_EMAIL..."
 
-WELCOME_PAYLOAD=$(cat <<EOF
+if step_completed "welcome_email"; then
+    echo "  [1/3] Welcome email: already sent"
+    WELCOME_SENT="true"
+else
+    echo "  [1/3] Sending welcome email to $ADMIN_EMAIL..."
+
+    WELCOME_PAYLOAD=$(cat <<EOF
 {
     "client_name": "$CLIENT_NAME",
     "admin_first_name": "$ADMIN_FIRST_NAME",
@@ -2112,38 +2191,44 @@ WELCOME_PAYLOAD=$(cat <<EOF
 EOF
 )
 
-WELCOME_RESPONSE=$(curl -s -w "\n%{http_code}" -X POST "$WELCOME_EMAIL_URL" \
-    -H "Content-Type: application/json" \
-    -d "$WELCOME_PAYLOAD" 2>/dev/null)
-WELCOME_HTTP=$(echo "$WELCOME_RESPONSE" | tail -1)
-WELCOME_BODY=$(echo "$WELCOME_RESPONSE" | head -n -1)
+    WELCOME_RESPONSE=$(curl -s -w "\n%{http_code}" -X POST "$WELCOME_EMAIL_URL" \
+        -H "Content-Type: application/json" \
+        -d "$WELCOME_PAYLOAD" 2>/dev/null)
+    WELCOME_HTTP=$(echo "$WELCOME_RESPONSE" | tail -1)
+    WELCOME_BODY=$(echo "$WELCOME_RESPONSE" | head -n -1)
 
-if [ "$WELCOME_HTTP" == "200" ] && echo "$WELCOME_BODY" | grep -q '"success":true'; then
-    log_success "Welcome email sent"
-    WELCOME_SENT="true"
-else
-    log_warning "Could not send welcome email (HTTP $WELCOME_HTTP)"
+    if [ "$WELCOME_HTTP" == "200" ] && echo "$WELCOME_BODY" | grep -q '"success":true'; then
+        log_success "Welcome email sent"
+        WELCOME_SENT="true"
+        mark_step_complete "welcome_email"
+    else
+        log_warning "Could not send welcome email (HTTP $WELCOME_HTTP)"
+    fi
 fi
 
 # ── Step 9b: Configure Telegram Webhook and Send Welcome Message ──
 if [ "$ENABLE_TELEGRAM" == "true" ] && [ -n "$TELEGRAM_WEBHOOK_URL" ]; then
     echo ""
-    echo "  [2/3] Setting up Telegram..."
-    
-    # Token should already be configured in secrets step - just retrieve it
-    TELEGRAM_TOKEN=$(gcloud secrets versions access latest --secret="CORCO_TELEGRAM_BOT_TOKEN" --project="$PROJECT_ID" 2>/dev/null || echo "")
-    
-    if [ -n "$TELEGRAM_TOKEN" ]; then
-        # Automatically set webhook
-        WEBHOOK_RESPONSE=$(curl -s "https://api.telegram.org/bot${TELEGRAM_TOKEN}/setWebhook?url=${TELEGRAM_WEBHOOK_URL}")
-        if echo "$WEBHOOK_RESPONSE" | grep -q '"ok":true'; then
-            log_success "Telegram webhook configured automatically"
-            
-            # Send welcome message to support group (if group exists)
-            if [ -n "$TELEGRAM_GROUP_ID" ]; then
-                echo "  Sending welcome message to Telegram group..."
+    if step_completed "welcome_telegram"; then
+        echo "  [2/3] Telegram welcome: already sent"
+        TELEGRAM_MSG_SENT="true"
+    else
+        echo "  [2/3] Setting up Telegram..."
+        
+        # Token should already be configured in secrets step - just retrieve it
+        TELEGRAM_TOKEN=$(gcloud secrets versions access latest --secret="CORCO_TELEGRAM_BOT_TOKEN" --project="$PROJECT_ID" 2>/dev/null || echo "")
+        
+        if [ -n "$TELEGRAM_TOKEN" ]; then
+            # Automatically set webhook
+            WEBHOOK_RESPONSE=$(curl -s "https://api.telegram.org/bot${TELEGRAM_TOKEN}/setWebhook?url=${TELEGRAM_WEBHOOK_URL}")
+            if echo "$WEBHOOK_RESPONSE" | grep -q '"ok":true'; then
+                log_success "Telegram webhook configured automatically"
                 
-                TELEGRAM_PAYLOAD=$(cat <<EOF
+                # Send welcome message to support group (if group exists)
+                if [ -n "$TELEGRAM_GROUP_ID" ]; then
+                    echo "  Sending welcome message to Telegram group..."
+                    
+                    TELEGRAM_PAYLOAD=$(cat <<EOF
 {
     "chat_id": "$TELEGRAM_GROUP_ID",
     "client_name": "$CLIENT_NAME",
@@ -2154,25 +2239,27 @@ if [ "$ENABLE_TELEGRAM" == "true" ] && [ -n "$TELEGRAM_WEBHOOK_URL" ]; then
 }
 EOF
 )
-                
-                TG_RESPONSE=$(curl -s -w "\n%{http_code}" -X POST "$WELCOME_TELEGRAM_URL" \
-                    -H "Content-Type: application/json" \
-                    -d "$TELEGRAM_PAYLOAD" 2>/dev/null)
-                TG_HTTP=$(echo "$TG_RESPONSE" | tail -1)
-                TG_BODY=$(echo "$TG_RESPONSE" | head -n -1)
-                
-                if [ "$TG_HTTP" == "200" ] && echo "$TG_BODY" | grep -q '"success":true'; then
-                    log_success "Welcome message sent to Telegram group"
-                    TELEGRAM_MSG_SENT="true"
-                else
-                    log_warning "Could not send Telegram welcome message"
+                    
+                    TG_RESPONSE=$(curl -s -w "\n%{http_code}" -X POST "$WELCOME_TELEGRAM_URL" \
+                        -H "Content-Type: application/json" \
+                        -d "$TELEGRAM_PAYLOAD" 2>/dev/null)
+                    TG_HTTP=$(echo "$TG_RESPONSE" | tail -1)
+                    TG_BODY=$(echo "$TG_RESPONSE" | head -n -1)
+                    
+                    if [ "$TG_HTTP" == "200" ] && echo "$TG_BODY" | grep -q '"success":true'; then
+                        log_success "Welcome message sent to Telegram group"
+                        TELEGRAM_MSG_SENT="true"
+                        mark_step_complete "welcome_telegram"
+                    else
+                        log_warning "Could not send Telegram welcome message"
+                    fi
                 fi
+            else
+                log_warning "Telegram webhook setup failed: $(echo "$WEBHOOK_RESPONSE" | grep -o '"description":"[^"]*"')"
             fi
         else
-            log_warning "Telegram webhook setup failed: $(echo "$WEBHOOK_RESPONSE" | grep -o '"description":"[^"]*"')"
+            log_warning "Telegram token not found - was it configured in the secrets step?"
         fi
-    else
-        log_warning "Telegram token not found - was it configured in the secrets step?"
     fi
 else
     echo ""
@@ -2182,9 +2269,13 @@ fi
 # ── Step 9c: Make Welcome Call (if Twilio enabled) ──
 if [ "$ENABLE_TWILIO" == "true" ] && [ -n "$ADMIN_PHONE" ]; then
     echo ""
-    echo "  [3/3] Making welcome call to $ADMIN_PHONE..."
-    
-    CALL_PAYLOAD=$(cat <<EOF
+    if step_completed "welcome_call"; then
+        echo "  [3/3] Welcome call: already made"
+        CALL_INITIATED="true"
+    else
+        echo "  [3/3] Making welcome call to $ADMIN_PHONE..."
+        
+        CALL_PAYLOAD=$(cat <<EOF
 {
     "to_number": "$ADMIN_PHONE",
     "client_name": "$CLIENT_NAME",
@@ -2195,20 +2286,22 @@ if [ "$ENABLE_TWILIO" == "true" ] && [ -n "$ADMIN_PHONE" ]; then
 }
 EOF
 )
-    
-    CALL_RESPONSE=$(curl -s -w "\n%{http_code}" -X POST "$WELCOME_CALL_URL" \
-        -H "Content-Type: application/json" \
-        -d "$CALL_PAYLOAD" 2>/dev/null)
-    CALL_HTTP=$(echo "$CALL_RESPONSE" | tail -1)
-    CALL_BODY=$(echo "$CALL_RESPONSE" | head -n -1)
-    
-    if [ "$CALL_HTTP" == "200" ] && echo "$CALL_BODY" | grep -q '"success":true'; then
-        CALL_SID=$(echo "$CALL_BODY" | grep -o '"call_sid":"[^"]*"' | cut -d'"' -f4)
-        log_success "Welcome call initiated (SID: $CALL_SID)"
-        CALL_INITIATED="true"
-        echo "  Note: Answer the call to verify the full pipeline. If you miss it, that's OK."
-    else
-        log_warning "Could not initiate welcome call"
+        
+        CALL_RESPONSE=$(curl -s -w "\n%{http_code}" -X POST "$WELCOME_CALL_URL" \
+            -H "Content-Type: application/json" \
+            -d "$CALL_PAYLOAD" 2>/dev/null)
+        CALL_HTTP=$(echo "$CALL_RESPONSE" | tail -1)
+        CALL_BODY=$(echo "$CALL_RESPONSE" | head -n -1)
+        
+        if [ "$CALL_HTTP" == "200" ] && echo "$CALL_BODY" | grep -q '"success":true'; then
+            CALL_SID=$(echo "$CALL_BODY" | grep -o '"call_sid":"[^"]*"' | cut -d'"' -f4)
+            log_success "Welcome call initiated (SID: $CALL_SID)"
+            CALL_INITIATED="true"
+            mark_step_complete "welcome_call"
+            echo "  Note: Answer the call to verify the full pipeline. If you miss it, that's OK."
+        else
+            log_warning "Could not initiate welcome call"
+        fi
     fi
 elif [ "$ENABLE_TWILIO" == "true" ]; then
     echo ""
