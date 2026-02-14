@@ -228,9 +228,20 @@ if [ -z "$PROJECT_ID" ] && [ -f "$REGISTRY_FILE" ]; then
 fi
 
 if [ -z "$PROJECT_ID" ]; then
-    log_warning "Could not determine project ID - will only clean up local files"
-    echo "  No tfvars file and no registry entry found."
-    echo "  Skipping GCP resource deletion."
+    # Last resort: derive project ID from domain (same convention as setup.sh)
+    SAFE_DOMAIN=$(echo "$DOMAIN" | tr '.' '-' | tr '[:upper:]' '[:lower:]')
+    DERIVED_ID="${SAFE_DOMAIN}-ingestion"
+    
+    # Verify the derived project actually exists
+    if gcloud projects describe "$DERIVED_ID" &>/dev/null 2>&1; then
+        PROJECT_ID="$DERIVED_ID"
+        REGION="${REGION:-us-central1}"
+        log_warning "Derived project ID from domain: $PROJECT_ID"
+    else
+        log_warning "Could not determine project ID - will only clean up local files"
+        echo "  No tfvars file, no registry entry, and derived ID $DERIVED_ID not found."
+        echo "  Skipping GCP resource deletion."
+    fi
 fi
 
 # -----------------------------------------------------------------------------
