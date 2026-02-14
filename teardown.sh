@@ -310,9 +310,12 @@ log_step "Verifying Authentication"
 
 # Determine if running in Cloud Shell or locally
 if [ -n "$CLOUD_SHELL" ] || [ -n "$GOOGLE_CLOUD_SHELL" ]; then
-    # Cloud Shell: already authenticated as the user
+    # Cloud Shell: already authenticated as the user. Do NOT activate
+    # configurations or change accounts — this corrupts Cloud Shell auth.
     echo "Running in Cloud Shell - using existing authentication"
-    gcloud config set project "$PROJECT_ID" --quiet
+    if [ -n "$PROJECT_ID" ]; then
+        gcloud config set project "$PROJECT_ID" --quiet
+    fi
 else
     # Local machine: use gcloud configuration based on domain
     # Map domain to configuration name
@@ -333,7 +336,7 @@ else
     fi
     
     # Test if we can access the project
-    if ! gcloud projects describe "$PROJECT_ID" --format="value(projectId)" &>/dev/null 2>&1; then
+    if [ -n "$PROJECT_ID" ] && ! gcloud projects describe "$PROJECT_ID" --format="value(projectId)" &>/dev/null 2>&1; then
         echo ""
         echo -e "${YELLOW}Cannot access project. Re-authenticating...${NC}"
         echo ""
@@ -345,7 +348,9 @@ else
         gcloud auth application-default login
     fi
     
-    gcloud config set project "$PROJECT_ID" --quiet
+    if [ -n "$PROJECT_ID" ]; then
+        gcloud config set project "$PROJECT_ID" --quiet
+    fi
 fi
 
 # Verify access (but don't fail - project might already be deleted)
