@@ -602,10 +602,22 @@ else
     log_success "Project created"
 fi
 
-# Link billing
-echo "Linking billing account..."
-gcloud billing projects link "$PROJECT_ID" --billing-account="$BILLING_ID" --quiet
-log_success "Billing linked"
+# Link billing (skip if already linked to the selected account)
+CURRENT_BILLING=$(gcloud billing projects describe "$PROJECT_ID" --format="value(billingAccountName)" 2>/dev/null || echo "")
+# CURRENT_BILLING comes back as "billingAccounts/XXXXXX-XXXXXX-XXXXXX"
+CURRENT_BILLING_ID=$(echo "$CURRENT_BILLING" | sed 's|billingAccounts/||')
+
+if [ "$CURRENT_BILLING_ID" = "$BILLING_ID" ]; then
+    log_success "Billing already linked to selected account"
+elif [ -n "$CURRENT_BILLING_ID" ] && [ "$CURRENT_BILLING_ID" != "$BILLING_ID" ]; then
+    echo "Switching billing from $CURRENT_BILLING_ID to $BILLING_ID..."
+    gcloud billing projects link "$PROJECT_ID" --billing-account="$BILLING_ID" --quiet
+    log_success "Billing re-linked"
+else
+    echo "Linking billing account..."
+    gcloud billing projects link "$PROJECT_ID" --billing-account="$BILLING_ID" --quiet
+    log_success "Billing linked"
+fi
 
 # Set as current project
 gcloud config set project "$PROJECT_ID" --quiet
