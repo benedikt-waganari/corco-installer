@@ -504,19 +504,15 @@ if [ "$KEEP_PROJECT" == "true" ] && [ "$PROJECT_EXISTS" == "true" ]; then
         echo "  [6/7] BigQuery: preserved (no --delete-data)"
     fi
     
-    # 7. Delete service accounts (created by Terraform)
-    echo "  [7/7] Service accounts..."
-    for sa in gmail-sync-sa twilio-ingest-sa; do
-        SA_EMAIL="${sa}@${PROJECT_ID}.iam.gserviceaccount.com"
-        if gcloud iam service-accounts describe "$SA_EMAIL" --project="$PROJECT_ID" &>/dev/null 2>&1; then
-            gcloud iam service-accounts delete "$SA_EMAIL" --project="$PROJECT_ID" --quiet 2>/dev/null || true
-            echo "    Deleted: $SA_EMAIL"
-        fi
-    done
-    log_success "Service accounts cleaned"
+    # 7. Service accounts — PRESERVED
+    # SAs are kept because:
+    #   - DWD configuration in Google Workspace Admin references the SA's uniqueId
+    #   - Deleting the SA invalidates DWD (requires manual re-configuration)
+    #   - SA keys stored in Secret Manager become useless if SA is deleted
+    echo "  [7/7] Service accounts: preserved (DWD depends on SA uniqueId)"
     
     echo ""
-    log_success "All resources removed. Project $PROJECT_ID preserved with billing intact."
+    log_success "All resources removed. Project $PROJECT_ID preserved with billing and SAs intact."
     
     # Mark as done so later sections skip GCP operations
     PROJECT_DELETED="false"
