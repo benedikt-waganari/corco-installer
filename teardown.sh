@@ -463,16 +463,27 @@ if [ "$KEEP_PROJECT" == "true" ] && [ "$PROJECT_EXISTS" == "true" ]; then
         echo "    No scheduler jobs found"
     fi
     
-    # 4. Delete CORCO_* secrets
+    # 4. Delete CORCO_* secrets (preserve SA key for DWD)
     if [ "$DELETE_SECRETS" == "true" ]; then
         echo "  [4/7] Secrets..."
-        SECRETS=$(gcloud secrets list --project="$PROJECT_ID" --filter="name:CORCO" --format="value(name)" 2>/dev/null || echo "")
+        # List all CORCO_* secrets (short names only)
+        SECRETS=$(gcloud secrets list --project="$PROJECT_ID" --format="value(name)" 2>/dev/null | grep "CORCO" || echo "")
         if [ -n "$SECRETS" ]; then
-            echo "$SECRETS" | while read secret; do
-                gcloud secrets delete "$secret" --project="$PROJECT_ID" --quiet 2>/dev/null || true
-                echo "    Deleted: $secret"
+            # Use for loop instead of pipe (avoids subshell issues)
+            for secret in $SECRETS; do
+                # Extract short name (gcloud may return full path or short name)
+                SHORT_NAME=$(basename "$secret")
+                if [ "$SHORT_NAME" = "CORCO_GMAIL_SA_KEY" ]; then
+                    echo "    Preserved: $SHORT_NAME (paired with service account + DWD)"
+                else
+                    if gcloud secrets delete "$SHORT_NAME" --project="$PROJECT_ID" --quiet 2>/dev/null; then
+                        echo "    Deleted: $SHORT_NAME"
+                    else
+                        echo "    Failed to delete: $SHORT_NAME"
+                    fi
+                fi
             done
-            log_success "Secrets deleted"
+            log_success "Secrets cleaned (SA key preserved)"
         else
             echo "    No CORCO_* secrets found"
         fi
@@ -898,21 +909,40 @@ echo "Domain:  $DOMAIN"
 echo "Project: $PROJECT_ID"
 echo ""
 echo "Summary:"
-echo "  • Infrastructure: DELETED"
-if [ "$DELETE_DATA" == "true" ]; then
-    echo -e "  • BigQuery data: ${RED}DELETED${NC}"
+if [ "$KEEP_PROJECT" == "true" ]; then
+    echo -e "  • Cloud Functions:   ${RED}DELETED${NC}"
+    echo -e "  • Scheduler jobs:    ${RED}DELETED${NC}"
+    echo -e "  • GCS buckets:       ${RED}DELETED${NC}"
+    if [ "$DELETE_DATA" == "true" ]; then
+        echo -e "  • BigQuery data:     ${RED}DELETED${NC}"
+    else
+        echo -e "  • BigQuery data:     ${GREEN}PRESERVED${NC}"
+    fi
+    if [ "$DELETE_SECRETS" == "true" ]; then
+        echo -e "  • Secrets:           ${RED}DELETED${NC} (SA key preserved for DWD)"
+    else
+        echo -e "  • Secrets:           ${GREEN}PRESERVED${NC}"
+    fi
+    echo -e "  • Service accounts:  ${GREEN}PRESERVED${NC}"
+    echo -e "  • GCP Project:       ${GREEN}PRESERVED${NC}"
+    echo -e "  • Billing:           ${GREEN}PRESERVED${NC}"
 else
-    echo -e "  • BigQuery data: ${GREEN}PRESERVED${NC}"
-fi
-if [ "$DELETE_SECRETS" == "true" ]; then
-    echo -e "  • Secrets: ${RED}DELETED${NC}"
-else
-    echo -e "  • Secrets: ${GREEN}PRESERVED${NC}"
-fi
-if [ "$DELETE_CONFIG" == "true" ]; then
-    echo -e "  • Configuration: ${RED}DELETED${NC}"
-else
-    echo -e "  • Configuration: ${GREEN}PRESERVED${NC}"
+    echo "  • Infrastructure: DELETED"
+    if [ "$DELETE_DATA" == "true" ]; then
+        echo -e "  • BigQuery data: ${RED}DELETED${NC}"
+    else
+        echo -e "  • BigQuery data: ${GREEN}PRESERVED${NC}"
+    fi
+    if [ "$DELETE_SECRETS" == "true" ]; then
+        echo -e "  • Secrets: ${RED}DELETED${NC}"
+    else
+        echo -e "  • Secrets: ${GREEN}PRESERVED${NC}"
+    fi
+    if [ "$DELETE_CONFIG" == "true" ]; then
+        echo -e "  • Configuration: ${RED}DELETED${NC}"
+    else
+        echo -e "  • Configuration: ${GREEN}PRESERVED${NC}"
+    fi
 fi
 if [ "$RESTORE_ORG_POLICY" == "true" ]; then
     echo -e "  • Org policy exception: ${RED}REMOVED${NC} (allUsers blocked)"
