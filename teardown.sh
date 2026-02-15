@@ -401,7 +401,13 @@ if [ -z "$PROJECT_ID" ]; then
     PROJECT_EXISTS="false"
     PROJECT_DELETED="true"  # Treat as already deleted for later logic
     log_warning "No project ID - skipping GCP resource deletion"
-# Check if project exists
+elif [ "$KEEP_PROJECT" == "true" ]; then
+    # For --keep-project, we know the project exists (setup just detected it).
+    # Don't test with gcloud projects describe — Cloud Shell auth can be flaky.
+    # Set the project explicitly and proceed.
+    PROJECT_EXISTS="true"
+    gcloud config set project "$PROJECT_ID" --quiet 2>/dev/null || true
+# Check if project exists (for --all and partial teardown only)
 elif ! gcloud projects describe "$PROJECT_ID" &>/dev/null 2>&1; then
     PROJECT_EXISTS="false"
     log_warning "Project $PROJECT_ID does not exist or is not accessible"
