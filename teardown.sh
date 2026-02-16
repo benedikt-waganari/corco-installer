@@ -88,6 +88,9 @@ DELETE_CONFIG=false
 KEEP_PROJECT=false
 RESTORE_ORG_POLICY=false
 FORCE=false
+SECRETS_DELETE_ATTEMPTED=false
+SECRETS_DELETE_VERIFIED=false
+SECRETS_REMAINING_LIST=""
 
 while [[ $# -gt 0 ]]; do
     case $1 in
@@ -125,6 +128,14 @@ while [[ $# -gt 0 ]]; do
             KEEP_PROJECT=true
             shift
             ;;
+        --project=*)
+            PROJECT_ID="${1#*=}"
+            shift
+            ;;
+        --project)
+            PROJECT_ID="$2"
+            shift 2
+            ;;
         --restore-org-policy)
             RESTORE_ORG_POLICY=true
             shift
@@ -144,6 +155,7 @@ while [[ $# -gt 0 ]]; do
             echo "  --delete-config      Also delete tfvars configuration file"
             echo "  --all                Delete everything (data + secrets + config + project)"
             echo "  --keep-project       With --all: delete resources but keep GCP project & billing"
+            echo "  --project=ID         Explicit project ID (skips tfvars/registry/domain derivation)"
             echo "  --restore-org-policy Reinstate iam.allowedPolicyMemberDomains restriction"
             echo "  --force, -f          Skip confirmation prompts"
             echo "  --help, -h           Show this help"
@@ -199,10 +211,13 @@ TFVARS_FILE="$TERRAFORM_DIR/environments/${DOMAIN}.tfvars"
 TFVARS_EXISTS=true
 
 if [ ! -f "$TFVARS_FILE" ]; then
-    log_warning "No configuration found for domain: $DOMAIN"
-    echo "Expected file: $TFVARS_FILE"
-    echo ""
-    echo "Will attempt cleanup using domain name and registry..."
+    # Only warn if project ID wasn't provided directly (via --project)
+    if [ -z "$PROJECT_ID" ]; then
+        log_warning "No configuration found for domain: $DOMAIN"
+        echo "Expected file: $TFVARS_FILE"
+        echo ""
+        echo "Will attempt cleanup using domain name and registry..."
+    fi
     TFVARS_EXISTS=false
 fi
 
@@ -213,12 +228,16 @@ parse_tfvar() {
     grep "^${key}[[:space:]]*=" "$file" 2>/dev/null | sed 's/.*=[[:space:]]*"\{0,1\}\([^"]*\)"\{0,1\}/\1/' | head -1
 }
 
-PROJECT_ID=""
+# PROJECT_ID may already be set via --project flag
 REGION=""
 DATASET=""
 WORKSPACE_ADMIN=""
 
-if [ "$TFVARS_EXISTS" == "true" ]; then
+if [ -n "$PROJECT_ID" ]; then
+    # Project ID provided via --project flag — skip all derivation
+    REGION="${REGION:-us-central1}"
+    echo "Using provided project ID: $PROJECT_ID"
+elif [ "$TFVARS_EXISTS" == "true" ]; then
     PROJECT_ID=$(parse_tfvar "$TFVARS_FILE" "gcp_project_id")
     REGION=$(parse_tfvar "$TFVARS_FILE" "region")
     DATASET=$(parse_tfvar "$TFVARS_FILE" "bigquery_dataset")
@@ -237,16 +256,33 @@ fi
 if [ -z "$PROJECT_ID" ]; then
     # Last resort: derive project ID from domain (same convention as setup.sh)
     SAFE_DOMAIN=$(echo "$DOMAIN" | tr '.' '-' | tr '[:upper:]' '[:lower:]')
-    DERIVED_ID="${SAFE_DOMAIN}-ingestion"
+    BASE_ID="${SAFE_DOMAIN}-ingestion"
+    # GCP project IDs max 30 chars (same truncation as setup.sh)
+    BASE_ID="${BASE_ID:0:30}"
     
-    # Verify the derived project actually exists
-    if gcloud projects describe "$DERIVED_ID" &>/dev/null 2>&1; then
-        PROJECT_ID="$DERIVED_ID"
+    # Check base ID first, then suffixed variants (-2, -3, ..., -9)
+    FOUND_PROJECT=""
+    if gcloud projects describe "$BASE_ID" --format="value(lifecycleState)" &>/dev/null 2>&1; then
+        FOUND_PROJECT="$BASE_ID"
+    else
+        for suffix in 2 3 4 5 6 7 8 9; do
+            SUFFIX_STR="-${suffix}"
+            MAX_BASE=$((30 - ${#SUFFIX_STR}))
+            CANDIDATE="${BASE_ID:0:$MAX_BASE}${SUFFIX_STR}"
+            if gcloud projects describe "$CANDIDATE" --format="value(lifecycleState)" &>/dev/null 2>&1; then
+                FOUND_PROJECT="$CANDIDATE"
+                break
+            fi
+        done
+    fi
+    
+    if [ -n "$FOUND_PROJECT" ]; then
+        PROJECT_ID="$FOUND_PROJECT"
         REGION="${REGION:-us-central1}"
         log_warning "Derived project ID from domain: $PROJECT_ID"
     else
         log_warning "Could not determine project ID - will only clean up local files"
-        echo "  No tfvars file, no registry entry, and derived ID $DERIVED_ID not found."
+        echo "  No tfvars file, no registry entry, and no project matching $BASE_ID[-N] found."
         echo "  Skipping GCP resource deletion."
     fi
 fi
@@ -365,28 +401,17 @@ fi
 # Notify Corco: Teardown Started
 # -----------------------------------------------------------------------------
 
-log_step "Notifying Corco: Teardown Started"
-
+# Notify Corco (silent — don't show internal callback status to user)
 DEPLOYER=$(gcloud config get-value account 2>/dev/null || echo "unknown")
-
 if command -v curl &> /dev/null; then
-    RESPONSE=$(curl -s -X POST "$TEARDOWN_CALLBACK_URL/start" \
+    curl -s -X POST "$TEARDOWN_CALLBACK_URL/start" \
         -H "Content-Type: application/json" \
         -d "{
             \"domain\": \"$DOMAIN\",
             \"token\": \"$TEARDOWN_TOKEN\",
             \"initiated_by\": \"$DEPLOYER\",
             \"timestamp\": \"$(date -u +"%Y-%m-%dT%H:%M:%SZ")\"
-        }" 2>&1 || echo "{\"error\": \"callback failed\"}")
-    
-    if echo "$RESPONSE" | grep -q "\"status\".*:.*\"ok\""; then
-        log_success "Corco notified of teardown start"
-    else
-        log_warning "Could not notify Corco (proceeding with teardown anyway)"
-        echo "  Response: $RESPONSE"
-    fi
-else
-    log_warning "curl not available - skipping Corco notification"
+        }" >/dev/null 2>&1 || true
 fi
 
 # -----------------------------------------------------------------------------
@@ -439,74 +464,148 @@ if [ "$KEEP_PROJECT" == "true" ] && [ "$PROJECT_EXISTS" == "true" ]; then
         echo "    No Telegram token found - skipping"
     fi
     
-    # 2. Delete all Cloud Functions (gen1 + gen2)
-    echo "  [2/7] Cloud Functions..."
-    FUNCTIONS=$(gcloud functions list --project="$PROJECT_ID" --format="value(name)" 2>/dev/null || echo "")
+    # 2. Delete all Cloud Functions (gen1 + gen2) AND orphaned Cloud Run services
+    echo "  [2/7] Cloud Functions + Cloud Run..."
+    
+    # 2a. Delete Cloud Functions
+    FUNCTIONS=$(gcloud functions list --project="$PROJECT_ID" --regions="$REGION" --format="value(name)" 2>/dev/null || echo "")
     if [ -n "$FUNCTIONS" ]; then
-        echo "$FUNCTIONS" | while read fn; do
-            # Determine region from function metadata
-            FN_REGION=$(gcloud functions describe "$fn" --project="$PROJECT_ID" --format="value(labels.deployment-tool)" 2>/dev/null || echo "")
-            gcloud functions delete "$fn" --region="$REGION" --project="$PROJECT_ID" --quiet 2>/dev/null || \
-            gcloud functions delete "$fn" --gen2 --region="$REGION" --project="$PROJECT_ID" --quiet 2>/dev/null || true
-            echo "    Deleted: $fn"
-        done
-        log_success "Cloud Functions deleted"
+        while IFS= read -r fn_full; do
+            [ -z "$fn_full" ] && continue
+            fn_name=$(basename "$fn_full")
+            if gcloud functions delete "$fn_name" --gen2 --region="$REGION" --project="$PROJECT_ID" --quiet 2>/dev/null; then
+                echo "    Deleted function: $fn_name"
+            elif gcloud functions delete "$fn_name" --region="$REGION" --project="$PROJECT_ID" --quiet 2>/dev/null; then
+                echo "    Deleted function: $fn_name (gen1)"
+            else
+                echo "    Failed to delete function: $fn_name"
+            fi
+        done <<< "$FUNCTIONS"
     else
-        echo "    No functions found"
+        echo "    No Cloud Functions found"
+    fi
+    
+    # 2b. Delete orphaned Cloud Run services (gen2 functions leave these behind)
+    RUN_SERVICES=$(gcloud run services list --project="$PROJECT_ID" --region="$REGION" --format="value(metadata.name)" 2>/dev/null || echo "")
+    if [ -n "$RUN_SERVICES" ]; then
+        while IFS= read -r svc; do
+            [ -z "$svc" ] && continue
+            if gcloud run services delete "$svc" --region="$REGION" --project="$PROJECT_ID" --quiet 2>/dev/null; then
+                echo "    Deleted Cloud Run service: $svc"
+            else
+                echo "    Failed to delete Cloud Run service: $svc"
+            fi
+        done <<< "$RUN_SERVICES"
+    fi
+    
+    # Verify: no functions AND no Cloud Run services remain
+    REMAINING_FNS=$(gcloud functions list --project="$PROJECT_ID" --regions="$REGION" --format="value(name)" 2>/dev/null || echo "")
+    REMAINING_RUN=$(gcloud run services list --project="$PROJECT_ID" --region="$REGION" --format="value(metadata.name)" 2>/dev/null || echo "")
+    if [ -z "$REMAINING_FNS" ] && [ -z "$REMAINING_RUN" ]; then
+        log_success "Cloud Functions and Cloud Run services deleted and verified"
+    else
+        log_warning "Some services remain after deletion"
+        if [ -n "$REMAINING_FNS" ]; then
+            echo "    Remaining functions:"
+            while IFS= read -r fn; do [ -z "$fn" ] && continue; echo "      - $(basename "$fn")"; done <<< "$REMAINING_FNS"
+        fi
+        if [ -n "$REMAINING_RUN" ]; then
+            echo "    Remaining Cloud Run services:"
+            while IFS= read -r svc; do [ -z "$svc" ] && continue; echo "      - $svc"; done <<< "$REMAINING_RUN"
+        fi
     fi
     
     # 3. Delete Cloud Scheduler jobs
     echo "  [3/7] Cloud Scheduler jobs..."
     JOBS=$(gcloud scheduler jobs list --project="$PROJECT_ID" --location="$REGION" --format="value(name)" 2>/dev/null || echo "")
     if [ -n "$JOBS" ]; then
-        echo "$JOBS" | while read job; do
-            JOB_NAME=$(basename "$job")
-            gcloud scheduler jobs delete "$JOB_NAME" --location="$REGION" --project="$PROJECT_ID" --quiet 2>/dev/null || true
-            echo "    Deleted: $JOB_NAME"
-        done
+        while IFS= read -r job_full; do
+            [ -z "$job_full" ] && continue
+            JOB_NAME=$(basename "$job_full")
+            if gcloud scheduler jobs delete "$JOB_NAME" --location="$REGION" --project="$PROJECT_ID" --quiet 2>/dev/null; then
+                echo "    Deleted: $JOB_NAME"
+            else
+                echo "    Failed to delete: $JOB_NAME"
+            fi
+        done <<< "$JOBS"
         log_success "Scheduler jobs deleted"
     else
         echo "    No scheduler jobs found"
     fi
     
-    # 4. Delete CORCO_* secrets (preserve SA key for DWD)
+    # 4. Delete CORCO_* secrets
     if [ "$DELETE_SECRETS" == "true" ]; then
         echo "  [4/7] Secrets..."
-        # List all CORCO_* secrets (short names only)
-        SECRETS=$(gcloud secrets list --project="$PROJECT_ID" --format="value(name)" 2>/dev/null | grep "CORCO" || echo "")
+        SECRETS_DELETE_ATTEMPTED=true
+        # List CORCO_* secrets (short names only)
+        ALL_SECRETS=$(gcloud secrets list --project="$PROJECT_ID" --format="value(name)" 2>/dev/null || echo "")
+        SECRETS=""
+        while IFS= read -r secret; do
+            [ -z "$secret" ] && continue
+            SHORT_NAME=$(basename "$secret")
+            if [[ "$SHORT_NAME" == CORCO_* ]]; then
+                SECRETS="${SECRETS}${SHORT_NAME}"$'\n'
+            fi
+        done <<< "$ALL_SECRETS"
         if [ -n "$SECRETS" ]; then
-            # Use for loop instead of pipe (avoids subshell issues)
-            for secret in $SECRETS; do
-                # Extract short name (gcloud may return full path or short name)
-                SHORT_NAME=$(basename "$secret")
-                if [ "$SHORT_NAME" = "CORCO_GMAIL_SA_KEY" ]; then
-                    echo "    Preserved: $SHORT_NAME (paired with service account + DWD)"
+            SECRET_DELETE_FAILURES=0
+            while IFS= read -r SHORT_NAME; do
+                [ -z "$SHORT_NAME" ] && continue
+                if gcloud secrets delete "$SHORT_NAME" --project="$PROJECT_ID" --quiet >/dev/null 2>&1; then
+                    echo "    Deleted: $SHORT_NAME"
                 else
-                    if gcloud secrets delete "$SHORT_NAME" --project="$PROJECT_ID" --quiet 2>/dev/null; then
-                        echo "    Deleted: $SHORT_NAME"
-                    else
-                        echo "    Failed to delete: $SHORT_NAME"
-                    fi
+                    echo "    Failed to delete: $SHORT_NAME"
+                    SECRET_DELETE_FAILURES=$((SECRET_DELETE_FAILURES + 1))
                 fi
-            done
-            log_success "Secrets cleaned (SA key preserved)"
+            done <<< "$SECRETS"
+
+            # Verify remaining CORCO_* secrets
+            REMAINING=$(gcloud secrets list --project="$PROJECT_ID" --format="value(name)" 2>/dev/null || echo "")
+            SECRETS_REMAINING_LIST=""
+            while IFS= read -r secret; do
+                [ -z "$secret" ] && continue
+                SHORT_NAME=$(basename "$secret")
+                if [[ "$SHORT_NAME" == CORCO_* ]]; then
+                    SECRETS_REMAINING_LIST="${SECRETS_REMAINING_LIST}${SHORT_NAME}"$'\n'
+                fi
+            done <<< "$REMAINING"
+
+            if [ -z "$SECRETS_REMAINING_LIST" ] && [ "$SECRET_DELETE_FAILURES" -eq 0 ]; then
+                SECRETS_DELETE_VERIFIED=true
+                log_success "Secrets deleted and verified"
+            else
+                SECRETS_DELETE_VERIFIED=false
+                log_warning "Secret deletion incomplete (some secrets remain or deletions failed)"
+                if [ -n "$SECRETS_REMAINING_LIST" ]; then
+                    echo "    Remaining secrets:"
+                    while IFS= read -r remaining_secret; do
+                        [ -z "$remaining_secret" ] && continue
+                        echo "      - $remaining_secret"
+                    done <<< "$SECRETS_REMAINING_LIST"
+                fi
+            fi
         else
             echo "    No CORCO_* secrets found"
+            SECRETS_DELETE_VERIFIED=true
         fi
     else
         echo "  [4/7] Secrets: preserved (no --delete-secrets)"
     fi
     
-    # 5. Delete GCS buckets
+    # 5. Delete GCS buckets (preserve tfstate — Terraform needs it on reinstall)
     echo "  [5/7] GCS buckets..."
-    for bucket in "${PROJECT_ID}-recordings" "${PROJECT_ID}-voice" "${PROJECT_ID}-tfstate"; do
+    for bucket in "${PROJECT_ID}-recordings" "${PROJECT_ID}-voice" "${PROJECT_ID}-function-source"; do
         if gsutil ls -b "gs://${bucket}" &>/dev/null 2>&1; then
             gsutil -m rm -r "gs://${bucket}/**" 2>/dev/null || true
             gsutil rb "gs://${bucket}" 2>/dev/null || true
             echo "    Deleted: gs://${bucket}"
         fi
     done
-    log_success "GCS buckets cleaned"
+    TFSTATE_BUCKET="${PROJECT_ID}-tfstate"
+    if gsutil ls -b "gs://${TFSTATE_BUCKET}" &>/dev/null 2>&1; then
+        echo "    Preserved: gs://${TFSTATE_BUCKET} (Terraform state — needed for idempotent reinstall)"
+    fi
+    log_success "GCS buckets cleaned (tfstate preserved)"
     
     # 6. Delete BigQuery dataset
     if [ "$DELETE_DATA" == "true" ]; then
@@ -694,18 +793,63 @@ fi
 
 if [ "$PROJECT_DELETED" == "true" ] || [ "$PROJECT_EXISTS" == "false" ]; then
     echo "Secrets deleted with project (or project not accessible)."
+elif [ "$SECRETS_DELETE_ATTEMPTED" == "true" ]; then
+    if [ "$SECRETS_DELETE_VERIFIED" == "true" ]; then
+        log_step "Secrets Deletion Verified"
+        echo "CORCO_* secrets removed successfully."
+    else
+        log_step "Secrets Deletion Incomplete"
+        echo "Some CORCO_* secrets could not be deleted."
+        if [ -n "$SECRETS_REMAINING_LIST" ]; then
+            echo "Remaining:"
+            while IFS= read -r remaining_secret; do
+                [ -z "$remaining_secret" ] && continue
+                echo "  • $remaining_secret"
+            done <<< "$SECRETS_REMAINING_LIST"
+        fi
+    fi
 elif [ "$DELETE_SECRETS" == "true" ]; then
     log_step "Deleting Secrets"
     
     echo "Finding CORCO_* secrets..."
-    SECRETS=$(gcloud secrets list --project="$PROJECT_ID" --filter="name:CORCO" --format="value(name)" 2>/dev/null || echo "")
+    SECRETS=$(gcloud secrets list --project="$PROJECT_ID" --format="value(name)" 2>/dev/null || echo "")
+    FILTERED_SECRETS=""
+    while IFS= read -r secret; do
+        [ -z "$secret" ] && continue
+        SHORT_NAME=$(basename "$secret")
+        if [[ "$SHORT_NAME" == CORCO_* ]]; then
+            FILTERED_SECRETS="${FILTERED_SECRETS}${SHORT_NAME}"$'\n'
+        fi
+    done <<< "$SECRETS"
     
-    if [ -n "$SECRETS" ]; then
-        echo "$SECRETS" | while read secret; do
+    if [ -n "$FILTERED_SECRETS" ]; then
+        while IFS= read -r secret; do
+            [ -z "$secret" ] && continue
             echo "Deleting: $secret"
             gcloud secrets delete "$secret" --project="$PROJECT_ID" --quiet 2>/dev/null || echo "  (already deleted or inaccessible)"
-        done
-        log_success "Secrets deleted"
+        done <<< "$FILTERED_SECRETS"
+
+        # Verify deletion
+        REMAINING=$(gcloud secrets list --project="$PROJECT_ID" --format="value(name)" 2>/dev/null || echo "")
+        STILL_THERE=""
+        while IFS= read -r secret; do
+            [ -z "$secret" ] && continue
+            SHORT_NAME=$(basename "$secret")
+            if [[ "$SHORT_NAME" == CORCO_* ]]; then
+                STILL_THERE="${STILL_THERE}${SHORT_NAME}"$'\n'
+            fi
+        done <<< "$REMAINING"
+
+        if [ -z "$STILL_THERE" ]; then
+            log_success "Secrets deleted and verified"
+        else
+            log_warning "Some secrets could not be deleted"
+            echo "Remaining:"
+            while IFS= read -r remaining_secret; do
+                [ -z "$remaining_secret" ] && continue
+                echo "  • $remaining_secret"
+            done <<< "$STILL_THERE"
+        fi
     else
         echo "No CORCO_* secrets found (already deleted or none existed)"
     fi
@@ -719,9 +863,8 @@ fi
 # Update Local Registry (if present)
 # -----------------------------------------------------------------------------
 
-log_step "Updating Local Registry"
-
 if [ -f "$REGISTRY_FILE" ]; then
+    log_step "Updating Local Registry"
     TIMESTAMP=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
     DEPLOYER=$(gcloud config get-value account 2>/dev/null || echo "unknown")
     
@@ -756,18 +899,15 @@ if [ -f "$REGISTRY_FILE" ]; then
         
         log_success "Local registry updated: $DOMAIN marked as torn down"
     fi
-else
-    log_warning "Local registry file not found - skipping local update"
 fi
 
 # -----------------------------------------------------------------------------
 # Notify Corco: Teardown Completed
 # -----------------------------------------------------------------------------
 
-log_step "Notifying Corco: Teardown Completed"
-
+# Notify Corco (silent)
 if command -v curl &> /dev/null; then
-    RESPONSE=$(curl -s -X POST "$TEARDOWN_CALLBACK_URL/complete" \
+    curl -s -X POST "$TEARDOWN_CALLBACK_URL/complete" \
         -H "Content-Type: application/json" \
         -d "{
             \"domain\": \"$DOMAIN\",
@@ -775,16 +915,7 @@ if command -v curl &> /dev/null; then
             \"delete_data\": $DELETE_DATA,
             \"delete_secrets\": $DELETE_SECRETS,
             \"timestamp\": \"$(date -u +"%Y-%m-%dT%H:%M:%SZ")\"
-        }" 2>&1 || echo "{\"error\": \"callback failed\"}")
-    
-    if echo "$RESPONSE" | grep -q "\"status\".*:.*\"ok\""; then
-        log_success "Corco notified of teardown completion"
-    else
-        log_warning "Could not notify Corco"
-        echo "  Response: $RESPONSE"
-    fi
-else
-    log_warning "curl not available - skipping Corco notification"
+        }" >/dev/null 2>&1 || true
 fi
 
 # -----------------------------------------------------------------------------
@@ -918,14 +1049,18 @@ echo "Summary:"
 if [ "$KEEP_PROJECT" == "true" ]; then
     echo -e "  • Cloud Functions:   ${RED}DELETED${NC}"
     echo -e "  • Scheduler jobs:    ${RED}DELETED${NC}"
-    echo -e "  • GCS buckets:       ${RED}DELETED${NC}"
+    echo -e "  • GCS buckets:       ${RED}DELETED${NC} (tfstate preserved)"
     if [ "$DELETE_DATA" == "true" ]; then
         echo -e "  • BigQuery data:     ${RED}DELETED${NC}"
     else
         echo -e "  • BigQuery data:     ${GREEN}PRESERVED${NC}"
     fi
     if [ "$DELETE_SECRETS" == "true" ]; then
-        echo -e "  • Secrets:           ${RED}DELETED${NC} (SA key preserved for DWD)"
+        if [ "$SECRETS_DELETE_VERIFIED" == "true" ]; then
+            echo -e "  • Secrets:           ${RED}DELETED${NC}"
+        else
+            echo -e "  • Secrets:           ${YELLOW}PARTIAL${NC} (check remaining list above)"
+        fi
     else
         echo -e "  • Secrets:           ${GREEN}PRESERVED${NC}"
     fi
